@@ -3,6 +3,9 @@ PHP                                                                        NEWS
 
 Backported from 8.2.33
 
+- Core:
+  . Fixed bug #73122 (Integer Overflow when concatenating strings). (cmb)
+
 - GD:
   . Upgrade libgd. (CVE-2026-9672) (Pierre Joye)
 
