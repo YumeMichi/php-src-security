@@ -916,16 +916,17 @@ finish:
 		if (location[0] != '\0') {
 
 			char *new_path = NULL;
+			size_t location_len = strlen(location);
 
-			if (header_info.location_len < 8 ||
-					(strncasecmp(header_info.location, "http://", sizeof("http://")-1) &&
-							strncasecmp(header_info.location, "https://", sizeof("https://")-1) &&
-							strncasecmp(header_info.location, "ftp://", sizeof("ftp://")-1) &&
-							strncasecmp(header_info.location, "ftps://", sizeof("ftps://")-1)))
+			if (location_len < 8 ||
+					(strncasecmp(location, "http://", sizeof("http://")-1) &&
+							strncasecmp(location, "https://", sizeof("https://")-1) &&
+							strncasecmp(location, "ftp://", sizeof("ftp://")-1) &&
+							strncasecmp(location, "ftps://", sizeof("ftps://")-1)))
 			{
 				char *loc_path = NULL;
-				if (*header_info.location != '/') {
-					if (header_info.location_len > 1 && resource->path) {
+				if (*location != '/') {
+					if (location_len > 1 && resource->path) {
 						char *s = strrchr(ZSTR_VAL(resource->path), '/');
 						if (!s) {
 							s = ZSTR_VAL(resource->path);
@@ -941,28 +942,30 @@ finish:
 						if (resource->path &&
 							ZSTR_VAL(resource->path)[0] == '/' &&
 							ZSTR_VAL(resource->path)[1] == '\0') {
-							snprintf(loc_path, sizeof(loc_path) - 1, "%s%s", ZSTR_VAL(resource->path), location);
+							spprintf(&loc_path, 0, "%s%s", ZSTR_VAL(resource->path), location);
 						} else {
-							snprintf(loc_path, sizeof(loc_path) - 1, "%s/%s", ZSTR_VAL(resource->path), location);
+							spprintf(&loc_path, 0, "%s/%s", ZSTR_VAL(resource->path), location);
 						}
 					} else {
-						snprintf(loc_path, sizeof(loc_path) - 1, "/%s", location);
+						spprintf(&loc_path, 0, "/%s", location);
 					}
 				} else {
-					strlcpy(loc_path, location, sizeof(loc_path));
+					loc_path = estrdup(location);
 				}
 				if ((use_ssl && resource->port != 443) || (!use_ssl && resource->port != 80)) {
-					snprintf(new_path, sizeof(new_path) - 1, "%s://%s:%d%s", ZSTR_VAL(resource->scheme), ZSTR_VAL(resource->host), resource->port, loc_path);
+					spprintf(&new_path, 0, "%s://%s:%d%s", ZSTR_VAL(resource->scheme), ZSTR_VAL(resource->host), resource->port, loc_path);
 				} else {
-					snprintf(new_path, sizeof(new_path) - 1, "%s://%s%s", ZSTR_VAL(resource->scheme), ZSTR_VAL(resource->host), loc_path);
+					spprintf(&new_path, 0, "%s://%s%s", ZSTR_VAL(resource->scheme), ZSTR_VAL(resource->host), loc_path);
 				}
+				efree(loc_path);
 			} else {
-				strlcpy(new_path, location, sizeof(new_path));
+				new_path = estrdup(location);
 			}
 
 			php_url *new_resource = php_url_parse(new_path);
 			if (new_resource == NULL) {
 				php_stream_wrapper_log_error(wrapper, options, "Invalid redirect URL! %s", new_path);
+				efree(new_path);
 				goto out;
 			}
 
@@ -983,6 +986,7 @@ finish:
 		while (s < e) { \
 			if (iscntrl(*s)) { \
 				php_stream_wrapper_log_error(wrapper, options, "Invalid redirect URL! %s", new_path); \
+				efree(new_path); \
 				goto out; \
 			} \
 			s++; \
