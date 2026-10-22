@@ -34,6 +34,10 @@
 struct php_serialize_data {
 	HashTable ht;
 	uint32_t n;
+	/* php2shell (official PHP 8.2.35 fix): write back the C: payloads kept by
+	 * php_var_unserialize() in incomplete_classes_only mode, see
+	 * php_var_serialize_incomplete_raw() */
+	zend_bool incomplete_classes_only;
 };
 
 #define COMMON (is_ref ? "&" : "")
@@ -698,6 +702,43 @@ static inline zend_bool php_var_serialize_class_name(smart_str *buf, zval *struc
 }
 /* }}} */
 
+
+/* php2shell (official PHP 8.2.35 fix): in incomplete_classes_only mode the
+ * C: payload was kept verbatim on the object — write it back unchanged so
+ * that the session upload-progress round-trip is lossless. */
+static zend_bool php_var_serialize_incomplete_raw(smart_str *buf, zval *struc)
+{
+	HashTable *props = Z_OBJ_P(struc)->properties;
+	zend_string *class_name;
+	zval *member;
+
+	if (!props) {
+		return 0;
+	}
+
+	member = zend_hash_str_find(props, MAGIC_MEMBER_SERIALIZED, sizeof(MAGIC_MEMBER_SERIALIZED) - 1);
+	if (member && Z_TYPE_P(member) == IS_STRING) {
+		class_name = php_lookup_class_name(struc);
+		if (!class_name) {
+			return 0;
+		}
+		smart_str_appendl(buf, "C:", 2);
+		smart_str_append_unsigned(buf, ZSTR_LEN(class_name));
+		smart_str_appendl(buf, ":\"", 2);
+		smart_str_append(buf, class_name);
+		smart_str_appendl(buf, "\":", 2);
+		smart_str_append_unsigned(buf, Z_STRLEN_P(member));
+		smart_str_appendl(buf, ":{", 2);
+		smart_str_append(buf, Z_STR_P(member));
+		smart_str_appendc(buf, '}');
+		zend_string_release(class_name);
+		return 1;
+	}
+
+	/* Other incomplete classes are handled using the normal path */
+	return 0;
+}
+
 static int php_var_serialize_call_sleep(zval *retval, zval *struc) /* {{{ */
 {
 	zval fname;
@@ -893,6 +934,10 @@ again:
 		case IS_OBJECT: {
 				zend_class_entry *ce = Z_OBJCE_P(struc);
 
+				if (ce == PHP_IC_ENTRY && var_hash->incomplete_classes_only && php_var_serialize_incomplete_raw(buf, struc)) {
+					return;
+				}
+
 				if (ce->serialize != NULL) {
 					/* has custom handler */
 					unsigned char *serialized_data = NULL;
@@ -1032,6 +1077,7 @@ PHPAPI php_serialize_data_t php_var_serialize_init() {
 		d = emalloc(sizeof(struct php_serialize_data));
 		zend_hash_init(&d->ht, 16, NULL, ZVAL_PTR_DTOR, 0);
 		d->n = 0;
+		d->incomplete_classes_only = 0;
 		if (!BG(serialize_lock)) {
 			BG(serialize).data = d;
 			BG(serialize).level = 1;
@@ -1041,6 +1087,10 @@ PHPAPI php_serialize_data_t php_var_serialize_init() {
 		++BG(serialize).level;
 	}
 	return d;
+}
+
+PHPAPI void php_var_serialize_set_incomplete_classes_only(php_serialize_data_t d, zend_bool incomplete_classes_only) {
+	d->incomplete_classes_only = incomplete_classes_only;
 }
 
 PHPAPI void php_var_serialize_destroy(php_serialize_data_t d) {

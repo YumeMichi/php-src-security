@@ -117,6 +117,7 @@ static inline void php_rinit_session_globals(void) /* {{{ */
 	PS(set_handler) = 0;
 	PS(mod_data) = NULL;
 	PS(mod_user_is_open) = 0;
+	PS(in_rfc1867_update) = 0; /* php2shell: never leak the upload-progress window across requests */
 	PS(define_sid) = 1;
 	PS(session_vars) = NULL;
 	PS(module_number) = my_module_number;
@@ -249,6 +250,7 @@ static int php_session_decode(zend_string *data) /* {{{ */
 		return FAILURE;
 	}
 	if (PS(serializer)->decode(ZSTR_VAL(data), ZSTR_LEN(data)) == FAILURE) {
+		PS(rfc1867_decode_refused) = 1; /* php2shell: must survive the destroy->rinit cycle below */
 		php_session_destroy();
 		php_session_track_init();
 		php_error_docref(NULL, E_WARNING, "Failed to decode session object. Session has been destroyed");
@@ -835,13 +837,35 @@ PHP_INI_END()
 /* ***************
    * Serializers *
    *************** */
+
+/* php2shell (official PHP 8.2.35 fix, CVE-2026-109619): the upload progress
+ * handler (php_session_rfc1867_update()) decodes and re-encodes the session
+ * during request startup, before user code may run. Objects are then kept as
+ * __PHP_Incomplete_Class: no autoloading, no unserialize_callback_func, no
+ * __wakeup(), and they are written back unchanged. */
+static void php_session_unserialize_init(php_unserialize_data_t *var_hash)
+{
+	PHP_VAR_UNSERIALIZE_INIT(*var_hash);
+	if (PS(in_rfc1867_update)) {
+		php_var_unserialize_set_incomplete_classes_only(*var_hash, 1);
+	}
+}
+
+static void php_session_serialize_init(php_serialize_data_t *var_hash)
+{
+	PHP_VAR_SERIALIZE_INIT(*var_hash);
+	if (PS(in_rfc1867_update)) {
+		php_var_serialize_set_incomplete_classes_only(*var_hash, 1);
+	}
+}
+
 PS_SERIALIZER_ENCODE_FUNC(php_serialize) /* {{{ */
 {
 	smart_str buf = {0};
 	php_serialize_data_t var_hash;
 
 	IF_SESSION_VARS() {
-		PHP_VAR_SERIALIZE_INIT(var_hash);
+		php_session_serialize_init(&var_hash);
 		php_var_serialize(&buf, Z_REFVAL(PS(http_session_vars)), &var_hash);
 		PHP_VAR_SERIALIZE_DESTROY(var_hash);
 	}
@@ -858,7 +882,7 @@ PS_SERIALIZER_DECODE_FUNC(php_serialize) /* {{{ */
 	zend_string *var_name = zend_string_init("_SESSION", sizeof("_SESSION") - 1, 0);
 
 	ZVAL_NULL(&session_vars);
-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
+	php_session_unserialize_init(&var_hash);
 	result = php_var_unserialize(
 		&session_vars, (const unsigned char **)&val, (const unsigned char *)endptr, &var_hash);
 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
@@ -891,7 +915,7 @@ PS_SERIALIZER_ENCODE_FUNC(php_binary) /* {{{ */
 	php_serialize_data_t var_hash;
 	PS_ENCODE_VARS;
 
-	PHP_VAR_SERIALIZE_INIT(var_hash);
+	php_session_serialize_init(&var_hash);
 
 	PS_ENCODE_LOOP(
 			if (ZSTR_LEN(key) > PS_BIN_MAX) continue;
@@ -916,7 +940,7 @@ PS_SERIALIZER_DECODE_FUNC(php_binary) /* {{{ */
 	php_unserialize_data_t var_hash;
 	zval *current, rv;
 
-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
+	php_session_unserialize_init(&var_hash);
 
 	for (p = val; p < endptr; ) {
 		namelen = ((unsigned char)(*p)) & (~PS_BIN_UNDEF);
@@ -957,7 +981,7 @@ PS_SERIALIZER_ENCODE_FUNC(php) /* {{{ */
 	php_serialize_data_t var_hash;
 	PS_ENCODE_VARS;
 
-	PHP_VAR_SERIALIZE_INIT(var_hash);
+	php_session_serialize_init(&var_hash);
 
 	PS_ENCODE_LOOP(
 		smart_str_appendl(&buf, ZSTR_VAL(key), ZSTR_LEN(key));
@@ -987,7 +1011,7 @@ PS_SERIALIZER_DECODE_FUNC(php) /* {{{ */
 	php_unserialize_data_t var_hash;
 	zval *current, rv;
 
-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
+	php_session_unserialize_init(&var_hash);
 
 	p = val;
 
@@ -2916,6 +2940,8 @@ static PHP_GINIT_FUNCTION(ps) /* {{{ */
 	ps_globals->mod = NULL;
 	ps_globals->serializer = NULL;
 	ps_globals->mod_data = NULL;
+	ps_globals->in_rfc1867_update = 0;
+	ps_globals->rfc1867_decode_refused = 0;
 	ps_globals->session_status = php_session_none;
 	ps_globals->default_mod = NULL;
 	ps_globals->mod_user_implemented = 0;
@@ -3106,10 +3132,41 @@ static zend_bool php_check_cancel_upload(php_session_rfc1867_progress *progress)
 	return Z_TYPE_P(cancel_upload) == IS_TRUE;
 } /* }}} */
 
+
+static void php_session_rfc1867_sync_counters(php_session_rfc1867_progress *progress) /* {{{ */
+{
+	zval *entry, *files, *file;
+
+	if (Z_ISUNDEF(progress->data) || Z_TYPE(progress->data) != IS_ARRAY) {
+		return;
+	}
+
+	/* php2shell: never retain HashTable bucket pointers — publishing progress
+	 * data may separate/replace the exported array (eness root-cause fix).
+	 * Resolve each counter afresh from the live array. */
+	if ((entry = zend_hash_str_find(Z_ARRVAL(progress->data), "bytes_processed", sizeof("bytes_processed") - 1)) != NULL) {
+		ZVAL_LONG(entry, progress->post_bytes_processed);
+	}
+	if ((files = zend_hash_str_find(Z_ARRVAL(progress->data), "files", sizeof("files") - 1)) == NULL
+			|| Z_TYPE_P(files) != IS_ARRAY) {
+		return;
+	}
+	if (zend_hash_num_elements(Z_ARRVAL_P(files)) == 0
+			|| (file = zend_hash_index_find(Z_ARRVAL_P(files), zend_hash_num_elements(Z_ARRVAL_P(files)) - 1)) == NULL
+			|| Z_TYPE_P(file) != IS_ARRAY) {
+		return;
+	}
+	if ((entry = zend_hash_str_find(Z_ARRVAL_P(file), "bytes_processed", sizeof("bytes_processed") - 1)) != NULL) {
+		ZVAL_LONG(entry, progress->current_file_bytes_processed);
+	}
+} /* }}} */
+
 static void php_session_rfc1867_update(php_session_rfc1867_progress *progress, int force_update) /* {{{ */
 {
+	php_session_rfc1867_sync_counters(progress);
+
 	if (!force_update) {
-		if (Z_LVAL_P(progress->post_bytes_processed) < progress->next_update) {
+		if (progress->post_bytes_processed < progress->next_update) {
 			return;
 		}
 #ifdef HAVE_GETTIMEOFDAY
@@ -3124,11 +3181,24 @@ static void php_session_rfc1867_update(php_session_rfc1867_progress *progress, i
 			progress->next_update_time = dtv + PS(rfc1867_min_freq);
 		}
 #endif
-		progress->next_update = Z_LVAL_P(progress->post_bytes_processed) + progress->update_step;
+		progress->next_update = progress->post_bytes_processed + progress->update_step;
 	}
 
-	php_session_initialize();
-	PS(session_status) = php_session_active;
+	PS(in_rfc1867_update) = 1;
+	PS(rfc1867_decode_refused) = 0;
+	if (php_session_initialize() == FAILURE) {
+		/* A refused decode stops the handler — the destroyed session record
+		 * must stay gone. Plain storage failures (e.g. an invalid sid)
+		 * keep the stock behavior: force the session active and continue. */
+		if (PS(rfc1867_decode_refused)) {
+			PS(in_rfc1867_update) = 0;
+			return;
+		}
+		PS(session_status) = php_session_active;
+	} else if (PS(session_status) != php_session_active) {
+		PS(in_rfc1867_update) = 0;
+		return;
+	}
 	IF_SESSION_VARS() {
 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
 		SEPARATE_ARRAY(sess_var);
@@ -3138,18 +3208,30 @@ static void php_session_rfc1867_update(php_session_rfc1867_progress *progress, i
 		zend_hash_update(Z_ARRVAL_P(sess_var), progress->key.s, &progress->data);
 	}
 	php_session_flush(1);
+	PS(in_rfc1867_update) = 0;
 } /* }}} */
 
 static void php_session_rfc1867_cleanup(php_session_rfc1867_progress *progress) /* {{{ */
 {
-	php_session_initialize();
-	PS(session_status) = php_session_active;
+	PS(in_rfc1867_update) = 1;
+	PS(rfc1867_decode_refused) = 0;
+	if (php_session_initialize() == FAILURE) {
+		if (PS(rfc1867_decode_refused)) {
+			PS(in_rfc1867_update) = 0;
+			return;
+		}
+		PS(session_status) = php_session_active;
+	} else if (PS(session_status) != php_session_active) {
+		PS(in_rfc1867_update) = 0;
+		return;
+	}
 	IF_SESSION_VARS() {
 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
 		SEPARATE_ARRAY(sess_var);
 		zend_hash_del(Z_ARRVAL_P(sess_var), progress->key.s);
 	}
 	php_session_flush(1);
+	PS(in_rfc1867_update) = 0;
 } /* }}} */
 
 static int php_session_rfc1867_callback(unsigned int event, void *event_data, void **extra) /* {{{ */
@@ -3169,6 +3251,10 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 	switch(event) {
 		case MULTIPART_EVENT_START: {
 			multipart_event_start *data = (multipart_event_start *) event_data;
+
+			/* php2shell (official PHP 8.2.35 fix): this runs before user code,
+			 * so we need to clear these early */
+			php_rinit_session_globals();
 			progress = ecalloc(1, sizeof(php_session_rfc1867_progress));
 			progress->content_length = data->content_length;
 			progress->sname_len  = strlen(PS(session_name));
@@ -3193,7 +3279,7 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 			if (data->name && data->value && value_len) {
 				size_t name_len = strlen(data->name);
 
-				if (name_len == progress->sname_len && memcmp(data->name, PS(session_name), name_len) == 0) {
+				if (!PS(use_only_cookies) && name_len == progress->sname_len && memcmp(data->name, PS(session_name), name_len) == 0) {
 					zval_ptr_dtor(&progress->sid);
 					ZVAL_STRINGL(&progress->sid, (*data->value), value_len);
 				} else if (name_len == strlen(PS(rfc1867_name)) && memcmp(data->name, PS(rfc1867_name), name_len + 1) == 0) {
@@ -3237,7 +3323,7 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 				add_assoc_bool_ex(&progress->data, "done", sizeof("done") - 1, 0);
 				add_assoc_zval_ex(&progress->data, "files", sizeof("files") - 1, &progress->files);
 
-				progress->post_bytes_processed = zend_hash_str_find(Z_ARRVAL(progress->data), "bytes_processed", sizeof("bytes_processed") - 1);
+				progress->post_bytes_processed = data->post_bytes_processed;
 
 				php_rinit_session(0);
 				PS(id) = zend_string_init(Z_STRVAL(progress->sid), Z_STRLEN(progress->sid), 0);
@@ -3253,7 +3339,23 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 
 			/* Each uploaded file has its own array. Trying to make it close to $_FILES entries. */
 			add_assoc_string_ex(&progress->current_file, "field_name", sizeof("field_name") - 1, data->name);
-			add_assoc_string_ex(&progress->current_file, "name", sizeof("name") - 1, *data->filename);
+			/* php2shell: sanitize filename before storing in session (blocks
+			 * session-file injection via LFI / handler-mismatch, ikow Chain A/C). */
+			{
+				char *safe_name = estrndup(*data->filename, strlen(*data->filename));
+				size_t i, j = 0;
+				size_t nlen = strlen(*data->filename);
+				for (i = 0; i < nlen && j < 255; i++) {
+					unsigned char c = (unsigned char)safe_name[i];
+					if (c == '\0' || c == '|' || c == '\r' || c == '\n') {
+						continue; /* strip null/pipe/CRLF — serializer breakout + injection */
+					}
+					safe_name[j++] = (char)c;
+				}
+				safe_name[j] = '\0';
+				add_assoc_string_ex(&progress->current_file, "name", sizeof("name") - 1, safe_name);
+				efree(safe_name);
+			}
 			add_assoc_null_ex(&progress->current_file, "tmp_name", sizeof("tmp_name") - 1);
 			add_assoc_long_ex(&progress->current_file, "error", sizeof("error") - 1, 0);
 
@@ -3263,9 +3365,7 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 
 			add_next_index_zval(&progress->files, &progress->current_file);
 
-			progress->current_file_bytes_processed = zend_hash_str_find(Z_ARRVAL(progress->current_file), "bytes_processed", sizeof("bytes_processed") - 1);
-
-			Z_LVAL_P(progress->current_file_bytes_processed) =  data->post_bytes_processed;
+			progress->current_file_bytes_processed = data->post_bytes_processed;
 			php_session_rfc1867_update(progress, 0);
 		}
 		break;
@@ -3276,8 +3376,8 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 				break;
 			}
 
-			Z_LVAL_P(progress->current_file_bytes_processed) = data->offset + data->length;
-			Z_LVAL_P(progress->post_bytes_processed) = data->post_bytes_processed;
+			progress->current_file_bytes_processed = data->offset + data->length;
+			progress->post_bytes_processed = data->post_bytes_processed;
 
 			php_session_rfc1867_update(progress, 0);
 		}
@@ -3296,7 +3396,7 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 			add_assoc_long_ex(&progress->current_file, "error", sizeof("error") - 1, data->cancel_upload);
 			add_assoc_bool_ex(&progress->current_file, "done", sizeof("done") - 1,  1);
 
-			Z_LVAL_P(progress->post_bytes_processed) = data->post_bytes_processed;
+			progress->post_bytes_processed = data->post_bytes_processed;
 
 			php_session_rfc1867_update(progress, 0);
 		}
@@ -3311,7 +3411,7 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 					if (!Z_ISUNDEF(progress->data)) {
 						SEPARATE_ARRAY(&progress->data);
 						add_assoc_bool_ex(&progress->data, "done", sizeof("done") - 1, 1);
-						Z_LVAL_P(progress->post_bytes_processed) = data->post_bytes_processed;
+						progress->post_bytes_processed = data->post_bytes_processed;
 						php_session_rfc1867_update(progress, 1);
 					}
 				}
@@ -3326,6 +3426,13 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 			efree(progress);
 			progress = NULL;
 			PS(rfc1867_progress) = NULL;
+
+			/* php2shell (official PHP 8.2.35 fix): $_SESSION was populated in
+			 * incomplete_classes_only mode — drop it so user code sees a fresh
+			 * session at startup */
+			zend_string *session_var_name = zend_string_init("_SESSION", strlen("_SESSION"), 0);
+			zend_delete_global_variable(session_var_name);
+			zend_string_release(session_var_name);
 		}
 		break;
 	}

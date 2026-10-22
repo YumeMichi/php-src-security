@@ -45,11 +45,17 @@ PHPAPI int php_var_unserialize_ref(zval *rval, const unsigned char **p, const un
 PHPAPI int php_var_unserialize_intern(zval *rval, const unsigned char **p, const unsigned char *max, php_unserialize_data_t *var_hash);
 
 PHPAPI php_serialize_data_t php_var_serialize_init(void);
+/* php2shell: official PHP 8.2.35 chain-C fix (CVE-2026-109619) */
+PHPAPI void php_var_serialize_set_incomplete_classes_only(php_serialize_data_t d, zend_bool incomplete_classes_only);
+/* php2shell: official PHP 8.2.35 chain-C fix (CVE-2026-109619) */
+PHPAPI void php_var_serialize_set_incomplete_classes_only(php_serialize_data_t d, zend_bool incomplete_classes_only);
 PHPAPI void php_var_serialize_destroy(php_serialize_data_t d);
 PHPAPI php_unserialize_data_t php_var_unserialize_init(void);
 PHPAPI void php_var_unserialize_destroy(php_unserialize_data_t d);
 PHPAPI HashTable *php_var_unserialize_get_allowed_classes(php_unserialize_data_t d);
 PHPAPI void php_var_unserialize_set_allowed_classes(php_unserialize_data_t d, HashTable *classes);
+PHPAPI void php_var_unserialize_set_incomplete_classes_only(php_unserialize_data_t d, zend_bool incomplete_classes_only);
+PHPAPI void php_var_unserialize_set_incomplete_classes_only(php_unserialize_data_t d, zend_bool incomplete_classes_only);
 
 #define PHP_VAR_SERIALIZE_INIT(d) \
 	(d) = php_var_serialize_init()

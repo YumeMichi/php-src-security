@@ -267,6 +267,10 @@ void shutdown_executor(void) /* {{{ */
 
 	zend_objects_store_free_object_storage(&EG(objects_store), fast_shutdown);
 
+	/* may be used by zend_error_zstr_at before init_executor */
+	EG(error_handling) = EH_NORMAL;
+	EG(exception) = NULL;
+
 	/* All resources and objects are destroyed. */
 	/* No PHP callback functions may be called after this point. */
 	EG(active) = 0;
@@ -285,6 +289,8 @@ void shutdown_executor(void) /* {{{ */
 		zend_hash_discard(EG(function_table), EG(persistent_functions_count));
 		zend_hash_discard(EG(class_table), EG(persistent_classes_count));
 		zend_cleanup_internal_classes();
+		EG(objects_store).object_buckets = NULL;
+		EG(objects_store).top = 1;
 	} else {
 		zend_hash_graceful_reverse_destroy(&EG(symbol_table));
 

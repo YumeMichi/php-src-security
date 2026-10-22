@@ -138,10 +138,10 @@ typedef struct _php_session_rfc1867_progress {
 	size_t    content_length;
 
 	zval      data;                 /* the array exported to session data */
-	zval	 *post_bytes_processed; /* data["bytes_processed"] */
+	zend_long post_bytes_processed;
 	zval      files;                /* data["files"] array */
 	zval      current_file;         /* array of currently uploading file */
-	zval	 *current_file_bytes_processed;
+	zend_long current_file_bytes_processed;
 } php_session_rfc1867_progress;
 
 typedef struct _php_ps_globals {
@@ -206,6 +206,8 @@ typedef struct _php_ps_globals {
 	zend_bool in_save_handler; /* state if session is in save handler or not */
 	zend_bool set_handler;     /* state if session module i setting handler or not */
 	zend_string *session_vars; /* serialized original session data */
+	zend_bool in_rfc1867_update;
+	zend_bool rfc1867_decode_refused;
 } php_ps_globals;
 
 typedef php_ps_globals zend_ps_globals;

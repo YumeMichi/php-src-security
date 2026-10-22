@@ -29,6 +29,11 @@ struct php_unserialize_data {
 	void *first_dtor;
 	void *last_dtor;
 	HashTable *allowed_classes;
+	/* php2shell (official PHP 8.2.35 fix): represent every object as
+	 * __PHP_Incomplete_Class, without resolving its class: no autoloading, no
+	 * unserialize_callback_func, no __wakeup(). C: values keep their raw
+	 * payload, so they serialize back to the same bytes. */
+	zend_bool incomplete_classes_only;
 };
 
 PHPAPI php_unserialize_data_t php_var_unserialize_init() {
@@ -63,6 +68,9 @@ PHPAPI HashTable *php_var_unserialize_get_allowed_classes(php_unserialize_data_t
 }
 PHPAPI void php_var_unserialize_set_allowed_classes(php_unserialize_data_t d, HashTable *classes) {
 	d->allowed_classes = classes;
+}
+PHPAPI void php_var_unserialize_set_incomplete_classes_only(php_unserialize_data_t d, zend_bool incomplete_classes_only) {
+	d->incomplete_classes_only = incomplete_classes_only;
 }
 
 
@@ -389,6 +397,18 @@ static inline size_t parse_uiv(const unsigned char *p)
 
 static int php_var_unserialize_internal(UNSERIALIZE_PARAMETER, int as_key);
 
+
+/* php2shell (official PHP 8.2.35 fix): the members that
+ * incomplete_classes_only mode writes itself — the class name of every
+ * object, and the payload kept for C: entries. Data that already carries one
+ * of them cannot be told apart from that bookkeeping, so it is rejected
+ * rather than silently overwritten. */
+static zend_always_inline zend_bool is_incomplete_class_reserved_member(const zend_string *name)
+{
+	return zend_string_equals_literal(name, MAGIC_MEMBER)
+		|| zend_string_equals_literal(name, MAGIC_MEMBER_SERIALIZED);
+}
+
 static zend_always_inline int process_nested_data(UNSERIALIZE_PARAMETER, HashTable *ht, zend_long elements, int objprops)
 {
 	while (elements-- > 0) {
@@ -432,6 +452,15 @@ numeric_key:
 				return 0;
 			}
 		} else {
+			if (var_hash && (*var_hash)->incomplete_classes_only
+			 && Z_TYPE(key) == IS_STRING
+			 && is_incomplete_class_reserved_member(Z_STR(key))) {
+				/* php2shell (official PHP 8.2.35 fix): reject data carrying the
+				 * incomplete-class bookkeeping property names during the
+				 * upload-progress decode window. */
+				zval_ptr_dtor(&key);
+				return 0;
+			}
 			if (EXPECTED(Z_TYPE(key) == IS_STRING)) {
 string_key:
 				if (Z_TYPE_P(rval) == IS_OBJECT
@@ -528,7 +557,7 @@ static inline int finish_nested_data(UNSERIALIZE_PARAMETER)
 	return 1;
 }
 
-static inline int object_custom(UNSERIALIZE_PARAMETER, zend_class_entry *ce)
+static inline int object_custom(UNSERIALIZE_PARAMETER, zend_class_entry *ce, zend_bool keep_payload)
 {
 	zend_long datalen;
 
@@ -548,7 +577,17 @@ static inline int object_custom(UNSERIALIZE_PARAMETER, zend_class_entry *ce)
 		return 0;
 	}
 
-	if (ce->unserialize == NULL) {
+	if (keep_payload) {
+		/* php2shell (official PHP 8.2.35 fix): the class was not resolved (see
+		 * php_var_unserialize_set_incomplete_classes_only()): keep the payload
+		 * verbatim, so that the object serializes back to the same bytes. */
+		zval payload;
+
+		ZEND_ASSERT(ce == PHP_IC_ENTRY);
+		ZVAL_STRINGL(&payload, (const char *) *p, datalen);
+		object_init_ex(rval, ce);
+		zend_hash_str_update(Z_OBJPROP_P(rval), MAGIC_MEMBER_SERIALIZED, sizeof(MAGIC_MEMBER_SERIALIZED) - 1, &payload);
+	} else if (ce->unserialize == NULL) {
 		zend_error(E_WARNING, "Class %s has no unserializer", ZSTR_VAL(ce->name));
 		object_init_ex(rval, ce);
 	} else if (ce->unserialize(rval, ce, (const unsigned char*)*p, datalen, (zend_unserialize_data *)var_hash) != SUCCESS) {
@@ -1224,6 +1263,13 @@ yy78:
 	class_name = zend_string_init(str, len, 0);
 
 	do {
+		if ((*var_hash)->incomplete_classes_only) {
+			/* php2shell (official PHP 8.2.35 fix): do not look the class up at
+			 * all, so that no user code can run (CVE-2026-109619). */
+			incomplete_class = 1;
+			ce = PHP_IC_ENTRY;
+			break;
+		}
 		if(!unserialize_allowed_class(class_name, var_hash)) {
 			incomplete_class = 1;
 			ce = PHP_IC_ENTRY;
@@ -1303,7 +1349,7 @@ yy78:
 	if (custom_object) {
 		int ret;
 
-		ret = object_custom(UNSERIALIZE_PASSTHRU, ce);
+		ret = object_custom(UNSERIALIZE_PASSTHRU, ce, (*var_hash)->incomplete_classes_only);
 
 		if (ret && incomplete_class) {
 			php_store_class_name(rval, ZSTR_VAL(class_name), len2);
